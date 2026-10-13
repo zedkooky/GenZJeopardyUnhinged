@@ -219,7 +219,7 @@ export default function App() {
 
   // Reset entire board state
   const handleResetBoard = () => {
-    if (window.confirm('Reset all clue tiles to available and clear team streaks?')) {
+    if (window.confirm('Reset all clue tiles and set every team score and streak back to 0?')) {
       setCategories((prev) =>
         prev.map((cat) => ({
           ...cat,
@@ -230,6 +230,7 @@ export default function App() {
           })),
         }))
       );
+      setTeams((prev) => prev.map((t) => ({ ...t, score: 0, streak: 0 })));
       setBuzzerQueue([]);
     }
   };
