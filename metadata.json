@@ -1,0 +1,6 @@
+{
+  "name": "Jeopardy! Unhinged",
+  "description": "Live trivia game show arena with presentation ingestion studio, Gemini AI deck builder, and mobile phone buzzers.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
