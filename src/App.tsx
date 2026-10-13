@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useCallback } from 'react';
+import React, { useState, useEffect, useCallback, useRef } from 'react';
 import { Header } from './components/Header';
 import { GameBoard } from './components/GameBoard';
 import { PodiumScoreboard } from './components/PodiumScoreboard';
@@ -11,6 +11,7 @@ import { BuzzerQueueModal } from './components/BuzzerQueueModal';
 import { Category, Clue, Team, StagingClue, BuzzerEvent } from './types/game';
 import { INITIAL_CATEGORIES, INITIAL_TEAMS, INITIAL_STAGING_BUFFER } from './data/defaultDeck';
 import { playBuzzerSound } from './utils/audio';
+import { openClue, closeClue, sendBuzz, fetchRoom, loadRoomCode } from './utils/realtime';
 
 export default function App() {
   // Check URL parameters for mode
@@ -34,7 +35,7 @@ export default function App() {
     return saved ? JSON.parse(saved) : INITIAL_STAGING_BUFFER;
   });
 
-  const [roomCode] = useState<string>('#SLAY-404');
+  const [roomCode] = useState<string>(loadRoomCode);
   const [soundEnabled, setSoundEnabled] = useState<boolean>(true);
   
   // Clue modal state
@@ -59,38 +60,61 @@ export default function App() {
     localStorage.setItem('jeopardy_staging', JSON.stringify(stagingBuffer));
   }, [stagingBuffer]);
 
-  // BroadcastChannel for cross-tab / mobile buzzer synchronization
-  useEffect(() => {
-    if (typeof BroadcastChannel === 'undefined') return;
-    const channel = new BroadcastChannel('jeopardy_live_room');
+  // Poll the room API so phones and the host board stay in sync across devices
+  const isBuzzerView = currentView === 'buzzer';
+  const activeClueId = activeClue?.id ?? null;
+  const teamsRef = useRef(teams);
+  teamsRef.current = teams;
+  const soundRef = useRef(soundEnabled);
+  soundRef.current = soundEnabled;
 
-    channel.onmessage = (event) => {
-      const data = event.data;
-      if (data?.type === 'BUZZ') {
-        const team = teams.find((t) => t.id === data.teamId);
-        if (team) {
-          setBuzzerQueue((prev) => {
-            if (prev.some((b) => b.teamId === data.teamId)) return prev;
-            return [...prev, {
-              teamId: data.teamId,
-              teamName: team.name,
-              timestamp: data.timestamp || Date.now(),
-              timeTakenMs: data.timeTakenMs || 350,
-            }];
-          });
-          if (soundEnabled) playBuzzerSound();
+  useEffect(() => {
+    let cancelled = false;
+    let timer: ReturnType<typeof setTimeout>;
+
+    const tick = async () => {
+      if (document.visibilityState === 'visible') {
+        const snap = await fetchRoom(roomCode);
+        if (snap && !cancelled) {
+          if (isBuzzerView) {
+            if (snap.teams?.length) setTeams(snap.teams);
+            if (snap.active && snap.active.clueId !== activeClueId) {
+              setActiveClue(snap.active.clue);
+              setActiveCategoryName(snap.active.categoryName);
+              setBuzzerQueue([]);
+            } else if (!snap.active && activeClueId) {
+              setActiveClue(null);
+              setBuzzerQueue([]);
+            }
+          }
+          const roomClueId = snap.active?.clueId ?? null;
+          if (roomClueId === activeClueId) {
+            setBuzzerQueue((prev) => {
+              const known = new Set(prev.map((b) => b.teamId));
+              const fresh = snap.buzzes
+                .filter((b) => !known.has(b.teamId))
+                .map((b) => ({
+                  teamId: b.teamId,
+                  teamName: teamsRef.current.find((t) => t.id === b.teamId)?.name ?? b.teamId,
+                  timestamp: b.timestamp,
+                  timeTakenMs: b.timeTakenMs || 350,
+                }));
+              if (fresh.length === 0) return prev;
+              if (soundRef.current && !isBuzzerView) playBuzzerSound();
+              return [...prev, ...fresh];
+            });
+          }
         }
-      } else if (data?.type === 'CLUE_ACTIVE') {
-        setActiveClue(data.clue);
-        setActiveCategoryName(data.categoryName);
-      } else if (data?.type === 'CLUE_CLOSED') {
-        setActiveClue(null);
-        setBuzzerQueue([]);
       }
+      if (!cancelled) timer = setTimeout(tick, activeClueId || isBuzzerView ? 800 : 2500);
     };
 
-    return () => channel.close();
-  }, [teams, soundEnabled]);
+    tick();
+    return () => {
+      cancelled = true;
+      clearTimeout(timer);
+    };
+  }, [roomCode, isBuzzerView, activeClueId]);
 
   // Trigger buzz for a team
   const triggerBuzzer = useCallback((teamId: string, timeTakenMs?: number) => {
@@ -107,24 +131,14 @@ export default function App() {
         timeTakenMs: timeTakenMs || 350,
       };
 
-      // Broadcast to other windows / tabs
-      if (typeof BroadcastChannel !== 'undefined') {
-        try {
-          const channel = new BroadcastChannel('jeopardy_live_room');
-          channel.postMessage({ type: 'BUZZ', teamId, timeTakenMs: newEvent.timeTakenMs, timestamp: newEvent.timestamp });
-          channel.close();
-        } catch {
-          // ignore
-        }
-      }
-
       return [...prev, newEvent];
     });
 
+    if (activeClueId) void sendBuzz(roomCode, activeClueId, teamId, timeTakenMs || 350);
     if (soundEnabled) {
       playBuzzerSound();
     }
-  }, [teams, soundEnabled]);
+  }, [teams, soundEnabled, activeClueId, roomCode]);
 
   // Keyboard shortcut listener (Keys 1 - 4 trigger buzz, Esc closes modals)
   useEffect(() => {
@@ -180,13 +194,7 @@ export default function App() {
     // 3. Clear buzzers & close modal
     setBuzzerQueue([]);
     setActiveClue(null);
-    if (typeof BroadcastChannel !== 'undefined') {
-      try {
-        const channel = new BroadcastChannel('jeopardy_live_room');
-        channel.postMessage({ type: 'CLUE_CLOSED' });
-        channel.close();
-      } catch {}
-    }
+    void closeClue(roomCode);
   };
 
   // Handle Clue Pass
@@ -201,13 +209,7 @@ export default function App() {
     );
     setBuzzerQueue([]);
     setActiveClue(null);
-    if (typeof BroadcastChannel !== 'undefined') {
-      try {
-        const channel = new BroadcastChannel('jeopardy_live_room');
-        channel.postMessage({ type: 'CLUE_CLOSED' });
-        channel.close();
-      } catch {}
-    }
+    void closeClue(roomCode);
   };
 
   // Adjust score manually
@@ -301,13 +303,7 @@ export default function App() {
                 setActiveClue(clue);
                 setActiveCategoryName(categoryName);
                 setBuzzerQueue([]); // Reset buzzer for this clue
-                if (typeof BroadcastChannel !== 'undefined') {
-                  try {
-                    const channel = new BroadcastChannel('jeopardy_live_room');
-                    channel.postMessage({ type: 'CLUE_ACTIVE', clue, categoryName });
-                    channel.close();
-                  } catch {}
-                }
+                void openClue(roomCode, clue, categoryName, teams);
               }}
               onResetBoard={handleResetBoard}
               onOpenDeckBuilder={() => setCurrentView('builder')}
