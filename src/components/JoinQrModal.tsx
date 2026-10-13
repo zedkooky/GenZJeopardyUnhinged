@@ -13,7 +13,7 @@ export const JoinQrModal: React.FC<JoinQrModalProps> = ({
   onOpenMobileView,
 }) => {
   const [copied, setCopied] = useState(false);
-  const joinUrl = typeof window !== 'undefined' ? `${window.location.origin}?mode=buzzer&room=${roomCode}` : `?mode=buzzer&room=${roomCode}`;
+  const joinUrl = typeof window !== 'undefined' ? `${window.location.origin}?mode=buzzer&room=${encodeURIComponent(roomCode)}` : `?mode=buzzer&room=${encodeURIComponent(roomCode)}`;
 
   const handleCopy = () => {
     navigator.clipboard.writeText(joinUrl);
