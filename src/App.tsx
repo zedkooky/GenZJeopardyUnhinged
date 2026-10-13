@@ -1,4 +1,5 @@
 import React, { useState, useEffect, useCallback, useRef } from 'react';
+import { SpeedInsights } from '@vercel/speed-insights/react';
 import { Header } from './components/Header';
 import { GameBoard } from './components/GameBoard';
 import { PodiumScoreboard } from './components/PodiumScoreboard';
@@ -367,6 +368,7 @@ export default function App() {
           onClose={() => setIsBuzzerQueueOpen(false)}
         />
       )}
+      <SpeedInsights />
     </div>
   );
 }
