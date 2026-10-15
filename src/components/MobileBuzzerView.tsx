@@ -1,19 +1,23 @@
-import React, { useState, useEffect } from 'react';
-import { Zap, CheckCircle2, AlertTriangle, ArrowLeft, Users, Hourglass } from 'lucide-react';
-import { Team, Clue, BuzzerEvent } from '../types/game';
-import type { JoinOutcome, RoomSnapshot } from '../utils/realtime';
+import React, { useState, useEffect, useRef } from 'react';
+import { Zap, CheckCircle2, AlertTriangle, ArrowLeft, Users, Hourglass, Lock, Timer, Ear } from 'lucide-react';
+import { Team, Clue } from '../types/game';
+import type { JoinOutcome, RoomClaim, RoomRound } from '../utils/realtime';
+import type { RoomInfo } from '../utils/useRoomSync';
+import { useRoundClock, formatClock } from '../utils/useRoundClock';
 import { playBuzzerSound } from '../utils/audio';
 
 const MAX_TEAM_NAME_LENGTH = 24;
-
-type RoomInfo = Pick<RoomSnapshot, 'playerCounts' | 'myTeamId' | 'maxPerTeam' | 'storage'>;
+const LOW_TIME_SECONDS = 5;
+const PENDING_BUZZ_MS = 1500;
 
 interface MobileBuzzerViewProps {
   roomCode: string;
   teams: Team[];
   roomInfo: RoomInfo | null;
   activeClue: Clue | null;
-  activeBuzz: BuzzerEvent | null;
+  round: RoomRound | null;
+  answerer: RoomClaim | null;
+  serverOffsetMs: number;
   soundEnabled: boolean;
   onBuzz: (teamId: string, timeTakenMs: number) => void;
   onJoinTeam: (teamId: string, teamName: string) => Promise<JoinOutcome>;
@@ -25,12 +29,16 @@ const JOIN_ERRORS: Record<Exclude<JoinOutcome, 'joined'>, string> = {
   failed: "Couldn't reach the game. Check your connection and that the host has the board open.",
 };
 
+type Tone = 'idle' | 'ready' | 'win' | 'lose';
+
 export const MobileBuzzerView: React.FC<MobileBuzzerViewProps> = ({
   roomCode,
   teams,
   roomInfo,
   activeClue,
-  activeBuzz,
+  round,
+  answerer,
+  serverOffsetMs,
   soundEnabled,
   onBuzz,
   onJoinTeam,
@@ -41,20 +49,22 @@ export const MobileBuzzerView: React.FC<MobileBuzzerViewProps> = ({
   const [isChangingTeam, setIsChangingTeam] = useState(false);
   const [isJoining, setIsJoining] = useState(false);
   const [joinError, setJoinError] = useState<string | null>(null);
-  const [hasBuzzed, setHasBuzzed] = useState(false);
-  const [clueStartTime, setClueStartTime] = useState<number>(Date.now());
+  const [isSendingBuzz, setIsSendingBuzz] = useState(false);
   const [reactionTime, setReactionTime] = useState<number | null>(null);
+  const openedAt = useRef<number>(Date.now());
+  const secondsLeft = useRoundClock(round, serverOffsetMs);
 
   const myTeam = teams.find((t) => t.id === roomInfo?.myTeamId) ?? null;
   const maxPerTeam = roomInfo?.maxPerTeam ?? 2;
   const showJoin = !myTeam || isChangingTeam;
+  const status = round?.status ?? null;
 
-  // Reset buzz state whenever a new clue opens or closes
+  // Time the buzzers opened, for the reaction time shown after a buzz
   useEffect(() => {
-    setHasBuzzed(false);
-    setReactionTime(null);
-    setClueStartTime(Date.now());
-  }, [activeClue?.id]);
+    if (status === 'open') openedAt.current = Date.now();
+    setIsSendingBuzz(false);
+  }, [status, round?.clueId]);
+  useEffect(() => setReactionTime(null), [round?.clueId]);
 
   const pickTeam = (team: Team) => {
     setPendingTeamId(team.id);
@@ -180,37 +190,71 @@ export const MobileBuzzerView: React.FC<MobileBuzzerViewProps> = ({
   }
 
   // ---------- Play screen ----------
-  const hasClue = activeClue !== null;
-  const teamBuzzedFirst = activeBuzz?.teamId === myTeam.id;
-  const otherTeamBuzzedFirst = activeBuzz !== null && !teamBuzzedFirst;
-  const canBuzz = hasClue && activeBuzz === null && !hasBuzzed;
+  const lockedOut = round?.lockedTeams.includes(myTeam.id) ?? false;
+  const myTeamAnswering = answerer?.teamId === myTeam.id;
+  const answeringTeam = teams.find((t) => t.id === answerer?.teamId);
+  const canBuzz = status === 'open' && !lockedOut && !isSendingBuzz;
+  const isLow = status === 'open' && secondsLeft <= LOW_TIME_SECONDS;
 
   const handleBuzzClick = () => {
     if (!canBuzz) return;
-    const timeTaken = Date.now() - clueStartTime;
-    setReactionTime(timeTaken);
-    setHasBuzzed(true);
+    setReactionTime(Date.now() - openedAt.current);
+    setIsSendingBuzz(true);
+    setTimeout(() => setIsSendingBuzz(false), PENDING_BUZZ_MS);
     if (navigator.vibrate) navigator.vibrate([100, 50, 100]);
     if (soundEnabled) playBuzzerSound();
-    onBuzz(myTeam.id, timeTaken);
+    onBuzz(myTeam.id, Date.now() - openedAt.current);
   };
 
-  const status = !hasClue
-    ? { icon: <Hourglass className="w-6 h-6" />, text: 'Waiting for the host to pick a clue', tone: 'text-[#ccc3d8] border-white/10' }
-    : teamBuzzedFirst
-      ? { icon: <CheckCircle2 className="w-6 h-6" />, text: 'Your team buzzed first! Give your answer.', tone: 'text-[#c3f400] border-[#c3f400]' }
-      : otherTeamBuzzedFirst
-        ? { icon: <AlertTriangle className="w-6 h-6" />, text: `${activeBuzz?.teamName} buzzed first`, tone: 'text-[#ffb4ab] border-red-500' }
-        : { icon: <Zap className="w-6 h-6" />, text: 'Buzz in if you know it!', tone: 'text-[#c3f400] border-[#c3f400]' };
+  let tone: Tone = 'idle';
+  let label = 'WAIT';
+  let message = 'Waiting for the host to pick a clue';
+  let icon = <Hourglass className="w-6 h-6" />;
+  let messageTone = 'text-[#ccc3d8] border-white/10';
 
-  const buttonLabel = !hasClue ? 'WAIT' : teamBuzzedFirst ? 'BUZZED!' : otherTeamBuzzedFirst ? 'LOCKED' : 'BUZZ!';
-  const buttonTone = !hasClue
-    ? 'bg-[#2b2932] border-gray-700 text-gray-500'
-    : teamBuzzedFirst
-      ? 'bg-[#c3f400] border-white text-black ring-8 ring-[#c3f400]/40'
-      : otherTeamBuzzedFirst
-        ? 'bg-[#2b2932] border-gray-700 text-gray-500'
-        : 'bg-[#7c3aed] border-[#c3f400] text-white animate-pulse shadow-[0_0_50px_rgba(124,58,237,0.5)]';
+  if (round) {
+    if (status === 'reading') {
+      message = 'Listen to the question. Buzzers open soon.';
+      icon = <Ear className="w-6 h-6" />;
+    } else if (status === 'open' && lockedOut) {
+      label = 'LOCKED';
+      message = 'Your team answered wrong and is locked out of this clue.';
+      icon = <Lock className="w-6 h-6" />;
+      messageTone = 'text-[#ffb4ab] border-red-500';
+    } else if (status === 'open') {
+      tone = 'ready';
+      label = isSendingBuzz ? '…' : 'BUZZ!';
+      message = 'Buzz in if you know it!';
+      icon = <Zap className="w-6 h-6" />;
+      messageTone = isLow ? 'text-[#ffb4ab] border-red-500' : 'text-[#c3f400] border-[#c3f400]';
+    } else if (status === 'answering' && myTeamAnswering) {
+      tone = 'win';
+      label = 'YOU’RE UP!';
+      message = 'Your team buzzed first! Give your answer.';
+      icon = <CheckCircle2 className="w-6 h-6" />;
+      messageTone = 'text-[#c3f400] border-[#c3f400]';
+    } else if (status === 'answering') {
+      tone = 'lose';
+      label = 'LOCKED';
+      message = `${answeringTeam?.name ?? 'Another team'} is answering`;
+      icon = <AlertTriangle className="w-6 h-6" />;
+      messageTone = 'text-[#ffb4ab] border-red-500';
+    } else if (status === 'ended') {
+      tone = 'lose';
+      label = round.endReason === 'exhausted' ? 'DONE' : 'TIME!';
+      message = round.endReason === 'exhausted' ? 'Every team has had a go at this clue.' : "Time's up! Buzzers are closed.";
+      icon = <Timer className="w-6 h-6" />;
+      messageTone = 'text-[#ffb4ab] border-red-500';
+    }
+  }
+
+  const buttonTone: Record<Tone, string> = {
+    idle: 'bg-[#2b2932] border-gray-700 text-gray-500',
+    ready: 'bg-[#7c3aed] border-[#c3f400] text-white animate-pulse shadow-[0_0_50px_rgba(124,58,237,0.5)]',
+    win: 'bg-[#c3f400] border-white text-black ring-8 ring-[#c3f400]/40',
+    lose: 'bg-[#2b2932] border-gray-700 text-gray-500',
+  };
+  const showClock = status === 'open' || status === 'answering';
 
   return (
     <div className="w-full max-w-md mx-auto flex flex-col gap-4 py-2 select-none">
@@ -220,7 +264,7 @@ export const MobileBuzzerView: React.FC<MobileBuzzerViewProps> = ({
           <span className="text-3xl">{myTeam.emoji}</span>
           <div className="min-w-0">
             <p className="font-space text-lg font-bold text-white uppercase truncate">{myTeam.name}</p>
-            {!hasClue && (
+            {!activeClue && (
               <button
                 type="button"
                 onClick={() => { setIsChangingTeam(true); setPendingTeamId(myTeam.id); setNameInput(myTeam.name); }}
@@ -252,24 +296,32 @@ export const MobileBuzzerView: React.FC<MobileBuzzerViewProps> = ({
       </div>
 
       {/* Status */}
-      <div role="status" className={`flex items-center justify-center gap-2 px-4 py-3 rounded-2xl border-2 bg-[#1d1a23] font-space text-base font-bold text-center ${status.tone}`}>
-        {status.icon}
-        <span>{status.text}</span>
+      <div role="status" className={`flex items-center justify-center gap-2 px-4 py-3 rounded-2xl border-2 bg-[#1d1a23] font-space text-base font-bold text-center ${messageTone}`}>
+        {icon}
+        <span>{message}</span>
       </div>
 
       {/* Buzzer */}
       <div className="flex flex-col items-center gap-3 py-2">
+        {showClock && (
+          <p
+            className={`font-space font-mono text-5xl font-bold ${isLow ? 'text-red-400 animate-pulse' : 'text-white'}`}
+            aria-label="Time remaining"
+          >
+            {formatClock(secondsLeft)}
+          </p>
+        )}
         <button
           type="button"
           onClick={handleBuzzClick}
-          disabled={!canBuzz && !teamBuzzedFirst}
-          aria-label={buttonLabel}
-          className={`w-60 h-60 rounded-full border-8 shadow-[0_10px_0_#000000] flex flex-col items-center justify-center transition-all ${buttonTone} ${
+          disabled={!canBuzz}
+          aria-label={label}
+          className={`w-60 h-60 rounded-full border-8 shadow-[0_10px_0_#000000] flex flex-col items-center justify-center transition-all ${buttonTone[tone]} ${
             canBuzz ? 'active:translate-y-2 active:shadow-[0_2px_0_#000000]' : 'cursor-not-allowed'
           }`}
         >
           <Zap className="w-16 h-16 mb-2 fill-current" />
-          <span className="font-space text-3xl font-bold uppercase tracking-wider">{buttonLabel}</span>
+          <span className="font-space text-3xl font-bold uppercase tracking-wider text-center">{label}</span>
         </button>
         {reactionTime !== null && (
           <p className="font-space text-sm text-[#ccc3d8]">Reaction time: {(reactionTime / 1000).toFixed(2)}s</p>

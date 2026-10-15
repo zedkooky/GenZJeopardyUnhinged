@@ -1,4 +1,8 @@
-import { countByTeam, getRoomStore, MAX_PLAYERS_PER_TEAM } from './_lib/roomStore.js';
+import { countByTeam, getRoomStore, MAX_PLAYERS_PER_TEAM, type RoomStore } from './_lib/roomStore.js';
+import {
+  canBuzz, claimRound, createRound, extendRound, releaseRound, settle, startRound, wrongAnswer,
+  DEFAULT_DURATION_MS, type RoomClue,
+} from './_lib/round.js';
 import { queryString, type ApiReq, type ApiRes } from './_lib/http.js';
 
 const ROOM_PATTERN = /^[A-Z0-9-]{4,24}$/;
@@ -6,8 +10,11 @@ const PLAYER_PATTERN = /^[A-Za-z0-9-]{8,64}$/;
 const MAX_TEAM_NAME_LENGTH = 24;
 
 /**
- * GET  /api/room?room=CODE[&playerId=ID] -> { active, teams, buzzes, teamNames, playerCounts, myTeamId, maxPerTeam, ... }
- * POST /api/room            -> { room, action: 'open' | 'close' | 'teams' | 'buzz' | 'join' | 'rename', ... }
+ * GET  /api/room?room=CODE[&playerId=ID]
+ *   -> { serverNow, active, answerer, teams, teamNames, playerCounts, myTeamId, maxPerTeam, storage }
+ * POST /api/room { room, action, ... }
+ *   host:   open | start | extend | wrong | release | close | teams
+ *   player: buzz | join | rename
  */
 export default async function handler(req: ApiReq, res: ApiRes) {
   try {
@@ -16,22 +23,7 @@ export default async function handler(req: ApiReq, res: ApiRes) {
     if (req.method === 'GET') {
       const room = queryString(req.query.room).toUpperCase();
       if (!ROOM_PATTERN.test(room)) return res.status(400).json({ error: 'Invalid room code' });
-      const playerId = queryString(req.query.playerId);
-      const [state, buzzes, players, teamNames] = await Promise.all([
-        store.getState(room),
-        store.getBuzzes(room),
-        store.getPlayers(room),
-        store.getTeamNames(room),
-      ]);
-      return res.status(200).json({
-        ...state,
-        buzzes,
-        teamNames,
-        playerCounts: countByTeam(players),
-        myTeamId: players[playerId] ?? null,
-        maxPerTeam: MAX_PLAYERS_PER_TEAM,
-        storage: store.kind,
-      });
+      return res.status(200).json(await snapshot(store, room, queryString(req.query.playerId)));
     }
 
     if (req.method !== 'POST') return res.status(405).json({ error: 'Method not allowed' });
@@ -39,44 +31,64 @@ export default async function handler(req: ApiReq, res: ApiRes) {
     const body = req.body ?? {};
     const room = String(body.room ?? '').toUpperCase();
     if (!ROOM_PATTERN.test(room)) return res.status(400).json({ error: 'Invalid room code' });
+    const now = Date.now();
 
     switch (body.action) {
       case 'open': {
         if (!body.clue?.id) return res.status(400).json({ error: 'clue is required' });
-        const state = await store.setActive(
+        await store.clearClaim(room);
+        await store.putActive(
           room,
-          { clueId: String(body.clue.id), categoryName: String(body.categoryName ?? ''), clue: body.clue },
-          Array.isArray(body.teams) ? body.teams : null,
+          createRound(
+            String(body.clue.id),
+            String(body.categoryName ?? ''),
+            body.clue,
+            Number(body.durationMs) || DEFAULT_DURATION_MS,
+          ),
         );
-        return res.status(200).json(state);
+        if (Array.isArray(body.teams)) await store.putTeams(room, body.teams);
+        return res.status(200).json(await snapshot(store, room, ''));
       }
-      case 'close':
-        return res.status(200).json(await store.setActive(room, null, null));
       case 'teams':
-        return res.status(200).json(await store.setState(room, { teams: Array.isArray(body.teams) ? body.teams : null }));
+        if (Array.isArray(body.teams)) await store.putTeams(room, body.teams);
+        return res.status(200).json({ ok: true });
+      case 'close':
+        await store.clearClaim(room);
+        await store.putActive(room, null);
+        return res.status(200).json({ ok: true });
+      case 'start':
+      case 'extend':
+      case 'wrong':
+      case 'release': {
+        const round = settle(await store.getActive(room), now);
+        if (!round) return res.status(409).json({ error: 'No active clue' });
+        const next = await applyHostAction(store, room, round, body, now);
+        await store.putActive(room, next);
+        return res.status(200).json(await snapshot(store, room, ''));
+      }
       case 'buzz': {
-        const state = await store.getState(room);
+        const round = settle(await store.getActive(room), now);
         const teamId = String(body.teamId ?? '');
         if (!teamId) return res.status(400).json({ error: 'teamId is required' });
-        // A buzz for a clue that is no longer open is stale; drop it.
-        if (!state.active || state.active.clueId !== String(body.clueId ?? '')) {
+        if (!round || round.clueId !== String(body.clueId ?? '')) {
           return res.status(409).json({ error: 'No matching active clue', accepted: false });
         }
-        const accepted = await store.addBuzz(room, {
-          teamId,
-          timestamp: Date.now(),
-          timeTakenMs: Number(body.timeTakenMs) || 0,
-        });
-        return res.status(200).json({ accepted });
+        if (!canBuzz(round, teamId)) {
+          // Persist a timed-out clock so everyone agrees the buzzers are closed.
+          await store.putActive(room, round);
+          return res.status(409).json({ error: 'Buzzers are closed for this team', accepted: false, status: round.status });
+        }
+        const won = await store.claim(room, { teamId, timestamp: now, timeTakenMs: Number(body.timeTakenMs) || 0 });
+        if (!won) return res.status(409).json({ error: 'Another team buzzed first', accepted: false });
+        await store.putActive(room, claimRound(round, now));
+        return res.status(200).json({ accepted: true });
       }
       case 'join': {
         const playerId = String(body.playerId ?? '');
         const teamId = String(body.teamId ?? '');
         if (!PLAYER_PATTERN.test(playerId)) return res.status(400).json({ error: 'Invalid player id' });
-        const state = await store.getState(room);
-        if (!state.teams?.some((t: { id: string }) => t.id === teamId)) {
-          return res.status(404).json({ error: 'Unknown team' });
-        }
+        const teams = await store.getTeams(room);
+        if (!teams?.some((t) => t.id === teamId)) return res.status(404).json({ error: 'Unknown team' });
         const result = await store.joinTeam(room, playerId, teamId);
         if (!result.ok) return res.status(409).json({ error: 'Team is full', playerCounts: result.counts });
         return res.status(200).json({ playerCounts: result.counts });
@@ -95,4 +107,52 @@ export default async function handler(req: ApiReq, res: ApiRes) {
     console.error('room api error', err);
     return res.status(500).json({ error: err instanceof Error ? err.message : 'Room error' });
   }
+}
+
+async function applyHostAction(
+  store: RoomStore,
+  room: string,
+  round: RoomClue,
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  body: any,
+  now: number,
+): Promise<RoomClue> {
+  switch (body.action) {
+    case 'start':
+      return startRound(round, now);
+    case 'extend':
+      return extendRound(round, Number(body.ms) || 0, now);
+    case 'release':
+      await store.clearClaim(room);
+      return releaseRound(round, now);
+    default: {
+      // wrong
+      const teamId = String(body.teamId ?? '');
+      const teams = (await store.getTeams(room)) ?? [];
+      await store.clearClaim(room);
+      return wrongAnswer(round, teamId, teams.map((t) => t.id), now);
+    }
+  }
+}
+
+async function snapshot(store: RoomStore, room: string, playerId: string) {
+  const now = Date.now();
+  const [stored, answerer, teams, players, teamNames] = await Promise.all([
+    store.getActive(room),
+    store.getClaim(room),
+    store.getTeams(room),
+    store.getPlayers(room),
+    store.getTeamNames(room),
+  ]);
+  return {
+    serverNow: now,
+    active: settle(stored, now),
+    answerer,
+    teams,
+    teamNames,
+    playerCounts: countByTeam(players),
+    myTeamId: players[playerId] ?? null,
+    maxPerTeam: MAX_PLAYERS_PER_TEAM,
+    storage: store.kind,
+  };
 }

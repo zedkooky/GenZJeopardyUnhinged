@@ -16,50 +16,93 @@ function getAudioContext(): AudioContext {
   return audioCtx;
 }
 
-export function playThinkMusic(): void {
+// Think-music motif: [frequency Hz, duration s, start offset s]. Loops every THINK_LOOP_SECONDS.
+const THINK_NOTES: ReadonlyArray<readonly [number, number, number]> = [
+  [261.63, 0.35, 0.0],
+  [349.23, 0.35, 0.35],
+  [261.63, 0.35, 0.7],
+  [174.61, 0.35, 1.05],
+  [261.63, 0.35, 1.4],
+  [349.23, 0.35, 1.75],
+  [261.63, 0.7, 2.1],
+  [261.63, 0.35, 2.9],
+  [349.23, 0.35, 3.25],
+  [440.0, 0.35, 3.6],
+  [392.0, 0.35, 3.95],
+  [349.23, 0.35, 4.3],
+  [329.63, 0.35, 4.65],
+  [293.66, 0.7, 5.0],
+];
+const THINK_LOOP_SECONDS = 6;
+const THINK_VOLUME = 0.18;
+
+let thinkTimer: ReturnType<typeof setTimeout> | null = null;
+let thinkGain: GainNode | null = null;
+let thinkOscillators: OscillatorNode[] = [];
+
+function scheduleThinkMotif(): void {
+  const ctx = getAudioContext();
+  if (!thinkGain) return;
+  const now = ctx.currentTime;
+  const master = thinkGain;
+
+  thinkOscillators = thinkOscillators.filter((o) => o.context.currentTime < now + 7);
+  THINK_NOTES.forEach(([freq, dur, delay]) => {
+    const osc = ctx.createOscillator();
+    const gain = ctx.createGain();
+    osc.type = 'triangle';
+    osc.frequency.setValueAtTime(freq, now + delay);
+    gain.gain.setValueAtTime(0, now + delay);
+    gain.gain.linearRampToValueAtTime(THINK_VOLUME, now + delay + 0.04);
+    gain.gain.exponentialRampToValueAtTime(0.001, now + delay + dur);
+    osc.connect(gain);
+    gain.connect(master);
+    osc.start(now + delay);
+    osc.stop(now + delay + dur);
+    thinkOscillators.push(osc);
+  });
+
+  thinkTimer = setTimeout(scheduleThinkMotif, THINK_LOOP_SECONDS * 1000);
+}
+
+/** Loops the think music in the background until stopThinkMusic() is called. Safe to call twice. */
+export function startThinkMusic(): void {
+  if (thinkTimer !== null) return;
   try {
     const ctx = getAudioContext();
-    const now = ctx.currentTime;
-    
-    // Jeopardy think motif notes (frequencies in Hz)
-    // C4, F4, C4, F3, C4, F4, C4
-    const notes = [
-      { freq: 261.63, dur: 0.35, delay: 0.0 },
-      { freq: 349.23, dur: 0.35, delay: 0.35 },
-      { freq: 261.63, dur: 0.35, delay: 0.70 },
-      { freq: 174.61, dur: 0.35, delay: 1.05 },
-      { freq: 261.63, dur: 0.35, delay: 1.40 },
-      { freq: 349.23, dur: 0.35, delay: 1.75 },
-      { freq: 261.63, dur: 0.70, delay: 2.10 },
-      // Second phrase
-      { freq: 261.63, dur: 0.35, delay: 2.90 },
-      { freq: 349.23, dur: 0.35, delay: 3.25 },
-      { freq: 440.00, dur: 0.35, delay: 3.60 },
-      { freq: 392.00, dur: 0.35, delay: 3.95 },
-      { freq: 349.23, dur: 0.35, delay: 4.30 },
-      { freq: 329.63, dur: 0.35, delay: 4.65 },
-      { freq: 293.66, dur: 0.70, delay: 5.00 },
-    ];
-
-    notes.forEach(({ freq, dur, delay }) => {
-      const osc = ctx.createOscillator();
-      const gain = ctx.createGain();
-      
-      osc.type = 'triangle';
-      osc.frequency.setValueAtTime(freq, now + delay);
-      
-      gain.gain.setValueAtTime(0, now + delay);
-      gain.gain.linearRampToValueAtTime(0.18, now + delay + 0.04);
-      gain.gain.exponentialRampToValueAtTime(0.001, now + delay + dur);
-
-      osc.connect(gain);
-      gain.connect(ctx.destination);
-
-      osc.start(now + delay);
-      osc.stop(now + delay + dur);
-    });
+    thinkGain = ctx.createGain();
+    thinkGain.gain.value = 1;
+    thinkGain.connect(ctx.destination);
+    scheduleThinkMotif();
   } catch (err) {
     console.warn('Audio playback error', err);
+  }
+}
+
+export function stopThinkMusic(): void {
+  if (thinkTimer !== null) {
+    clearTimeout(thinkTimer);
+    thinkTimer = null;
+  }
+  const master = thinkGain;
+  thinkGain = null;
+  if (!master) return;
+  try {
+    const ctx = getAudioContext();
+    master.gain.cancelScheduledValues(ctx.currentTime);
+    master.gain.setValueAtTime(master.gain.value, ctx.currentTime);
+    master.gain.linearRampToValueAtTime(0, ctx.currentTime + 0.1);
+    thinkOscillators.forEach((osc) => {
+      try {
+        osc.stop(ctx.currentTime + 0.12);
+      } catch {
+        // already stopped
+      }
+    });
+    thinkOscillators = [];
+    setTimeout(() => master.disconnect(), 200);
+  } catch {
+    master.disconnect();
   }
 }
 
@@ -213,4 +256,11 @@ export function playDailyDouble(): void {
   } catch (err) {
     console.warn('Audio error', err);
   }
+}
+
+/** One-shot preview of the think music (soundboard button). Does nothing if it is already looping. */
+export function playThinkMusic(): void {
+  if (thinkTimer !== null) return;
+  startThinkMusic();
+  setTimeout(stopThinkMusic, (THINK_LOOP_SECONDS - 0.2) * 1000);
 }

@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useCallback, useRef } from 'react';
+import React, { useState, useEffect, useCallback, useRef, useMemo } from 'react';
 import { Header } from './components/Header';
 import { GameBoard } from './components/GameBoard';
 import { PodiumScoreboard } from './components/PodiumScoreboard';
@@ -10,8 +10,12 @@ import { JoinQrModal } from './components/JoinQrModal';
 import { BuzzerQueueModal } from './components/BuzzerQueueModal';
 import { Category, Clue, Team, StagingClue, BuzzerEvent } from './types/game';
 import { INITIAL_CATEGORIES, INITIAL_TEAMS, INITIAL_STAGING_BUFFER, MAX_TEAMS } from './data/defaultDeck';
-import { playBuzzerSound } from './utils/audio';
-import { openClue, closeClue, sendBuzz, fetchRoom, loadRoomCode, loadPlayerId, joinTeam, renameTeam, publishTeams, type RoomSnapshot, type JoinOutcome } from './utils/realtime';
+import {
+  openClue, startRound, extendRound, markWrong, releaseBuzzer, closeClue, sendBuzz, loadRoomCode,
+  loadPlayerId, loadTimerSeconds, joinTeam, renameTeam, publishTeams, MIN_TIMER_SECONDS, MAX_TIMER_SECONDS,
+  type JoinOutcome,
+} from './utils/realtime';
+import { useRoomSync } from './utils/useRoomSync';
 
 export default function App() {
   // Check URL parameters for mode
@@ -22,8 +26,6 @@ export default function App() {
   // A phone that opened the join link: show only the buzzer, never the host controls
   const isPhoneDevice = initialMode === 'buzzer';
   const [playerId] = useState<string>(loadPlayerId);
-  const [roomInfo, setRoomInfo] = useState<Pick<RoomSnapshot, 'playerCounts' | 'myTeamId' | 'maxPerTeam' | 'storage'> | null>(null);
-  const appliedNameAt = useRef<Record<string, number>>({});
 
   const [currentView, setCurrentView] = useState<'board' | 'builder' | 'buzzer'>(initialMode);
   const [categories, setCategories] = useState<Category[]>(() => {
@@ -43,13 +45,11 @@ export default function App() {
 
   const [roomCode] = useState<string>(loadRoomCode);
   const [soundEnabled, setSoundEnabled] = useState<boolean>(true);
-  
+  const [timerSeconds, setTimerSeconds] = useState<number>(loadTimerSeconds);
+
   // Clue modal state
   const [activeClue, setActiveClue] = useState<Clue | null>(null);
   const [activeCategoryName, setActiveCategoryName] = useState<string>('');
-
-  // Buzzer queue state
-  const [buzzerQueue, setBuzzerQueue] = useState<BuzzerEvent[]>([]);
   const [isQrModalOpen, setIsQrModalOpen] = useState<boolean>(false);
   const [isBuzzerQueueOpen, setIsBuzzerQueueOpen] = useState<boolean>(false);
 
@@ -66,82 +66,44 @@ export default function App() {
     localStorage.setItem('jeopardy_staging', JSON.stringify(stagingBuffer));
   }, [stagingBuffer]);
 
-  // Poll the room API so phones and the host board stay in sync across devices
+  const handleChangeTimerSeconds = (seconds: number) => {
+    const clamped = Math.min(MAX_TIMER_SECONDS, Math.max(MIN_TIMER_SECONDS, Math.round(seconds) || 0));
+    setTimerSeconds(clamped);
+    try {
+      localStorage.setItem('jeopardy_timer_seconds', String(clamped));
+    } catch {
+      // storage unavailable: the setting simply won't persist
+    }
+  };
+
+  // The server owns the round (clock, buzzer lock, who is answering); everything below reads from it
   const isBuzzerView = currentView === 'buzzer';
-  const activeClueId = activeClue?.id ?? null;
   const teamsRef = useRef(teams);
   teamsRef.current = teams;
-  const soundRef = useRef(soundEnabled);
-  soundRef.current = soundEnabled;
+  const { round, answerer, serverOffsetMs, roomInfo, refresh } = useRoomSync({
+    roomCode,
+    playerId,
+    isBuzzerView,
+    isPhoneDevice,
+    activeClueId: activeClue?.id ?? null,
+    setTeams,
+    setActiveClue,
+    setActiveCategoryName,
+  });
 
-  useEffect(() => {
-    let cancelled = false;
-    let timer: ReturnType<typeof setTimeout>;
+  const activeRound = round && activeClue && round.clueId === activeClue.id ? round : null;
 
-    const tick = async () => {
-      if (document.visibilityState === 'visible') {
-        const snap = await fetchRoom(roomCode, isPhoneDevice ? playerId : undefined);
-        if (snap && !cancelled) {
-          if (isBuzzerView) {
-            if (snap.teams?.length) {
-              // Renames made on phones show immediately, before the host board has applied them
-              const named = snap.teams.map((t) => ({ ...t, name: snap.teamNames?.[t.id]?.name ?? t.name }));
-              setTeams((prev) => (JSON.stringify(prev) === JSON.stringify(named) ? prev : named));
-            }
-            setRoomInfo((prev) => {
-              const next = { playerCounts: snap.playerCounts, myTeamId: snap.myTeamId, maxPerTeam: snap.maxPerTeam, storage: snap.storage };
-              return JSON.stringify(prev) === JSON.stringify(next) ? prev : next;
-            });
-            if (snap.active && snap.active.clueId !== activeClueId) {
-              setActiveClue(snap.active.clue);
-              setActiveCategoryName(snap.active.categoryName);
-              setBuzzerQueue([]);
-            } else if (!snap.active && activeClueId) {
-              setActiveClue(null);
-              setBuzzerQueue([]);
-            }
-          }
-          if (!isBuzzerView) {
-            // Players can rename their team from their phone; the host applies each rename once
-            const renames = Object.entries(snap.teamNames ?? {}).filter(
-              ([id, v]) => v.at > (appliedNameAt.current[id] ?? 0),
-            );
-            if (renames.length > 0) {
-              renames.forEach(([id, v]) => { appliedNameAt.current[id] = v.at; });
-              setTeams((prev) => prev.map((t) => {
-                const hit = renames.find(([id]) => id === t.id);
-                return hit ? { ...t, name: hit[1].name } : t;
-              }));
-            }
-          }
-          const roomClueId = snap.active?.clueId ?? null;
-          if (roomClueId === activeClueId) {
-            setBuzzerQueue((prev) => {
-              const known = new Set(prev.map((b) => b.teamId));
-              const fresh = snap.buzzes
-                .filter((b) => !known.has(b.teamId))
-                .map((b) => ({
-                  teamId: b.teamId,
-                  teamName: teamsRef.current.find((t) => t.id === b.teamId)?.name ?? b.teamId,
-                  timestamp: b.timestamp,
-                  timeTakenMs: b.timeTakenMs || 350,
-                }));
-              if (fresh.length === 0) return prev;
-              if (soundRef.current && !isBuzzerView) playBuzzerSound();
-              return [...prev, ...fresh];
-            });
-          }
-        }
-      }
-      if (!cancelled) timer = setTimeout(tick, activeClueId || isBuzzerView ? 800 : 2500);
-    };
-
-    tick();
-    return () => {
-      cancelled = true;
-      clearTimeout(timer);
-    };
-  }, [roomCode, isBuzzerView, activeClueId]);
+  const buzzerQueue = useMemo<BuzzerEvent[]>(() => {
+    if (!activeRound || !answerer) return [];
+    const team = teams.find((t) => t.id === answerer.teamId);
+    return [{
+      teamId: answerer.teamId,
+      teamName: team?.name ?? answerer.teamId,
+      timestamp: answerer.timestamp,
+      timeTakenMs: answerer.timeTakenMs,
+    }];
+  }, [activeRound, answerer, teams]);
+  const activeBuzz = buzzerQueue[0] ?? null;
 
   // Host keeps the room's team list (names + scores) fresh for phones
   const teamsSignature = JSON.stringify(teams.map((t) => [t.id, t.name, t.score, t.emoji]));
@@ -161,61 +123,57 @@ export default function App() {
       await renameTeam(roomCode, teamId, cleaned);
       setTeams((prev) => prev.map((t) => (t.id === teamId ? { ...t, name: cleaned } : t)));
     }
-    const snap = await fetchRoom(roomCode, playerId);
-    if (snap) setRoomInfo({ playerCounts: snap.playerCounts, myTeamId: snap.myTeamId, maxPerTeam: snap.maxPerTeam, storage: snap.storage });
+    await refresh();
     return 'joined';
-  }, [roomCode, playerId]);
+  }, [roomCode, playerId, refresh]);
 
-  // Trigger buzz for a team
-  const triggerBuzzer = useCallback((teamId: string, timeTakenMs?: number) => {
-    const team = teams.find((t) => t.id === teamId);
-    if (!team) return;
+  // A team buzzes (phone tap, or host keyboard / podium). The server decides who won.
+  const triggerBuzzer = useCallback(async (teamId: string, timeTakenMs?: number) => {
+    if (!activeClue) return;
+    await sendBuzz(roomCode, activeClue.id, teamId, timeTakenMs || 0);
+    await refresh();
+  }, [activeClue, roomCode, refresh]);
 
-    // Check if team already in queue
-    setBuzzerQueue((prev) => {
-      if (prev.some((b) => b.teamId === teamId)) return prev;
-      const newEvent: BuzzerEvent = {
-        teamId,
-        teamName: team.name,
-        timestamp: Date.now(),
-        timeTakenMs: timeTakenMs || 350,
-      };
+  // Host round controls
+  const handleOpenClue = (clue: Clue, categoryName: string) => {
+    setActiveClue(clue);
+    setActiveCategoryName(categoryName);
+    void openClue(roomCode, clue, categoryName, teams, timerSeconds * 1000).then(refresh);
+  };
+  const handleStartRound = useCallback(() => void startRound(roomCode).then(refresh), [roomCode, refresh]);
+  const handleExtendRound = useCallback((seconds: number) => void extendRound(roomCode, seconds * 1000).then(refresh), [roomCode, refresh]);
+  const handleReleaseBuzzer = useCallback(() => void releaseBuzzer(roomCode).then(refresh), [roomCode, refresh]);
 
-      return [...prev, newEvent];
-    });
+  // Close the dialog without scoring or marking the tile (Esc / close)
+  const handleDismissClue = useCallback(() => {
+    setActiveClue(null);
+    void closeClue(roomCode).then(refresh);
+  }, [roomCode, refresh]);
 
-    if (activeClueId) void sendBuzz(roomCode, activeClueId, teamId, timeTakenMs || 350);
-    if (soundEnabled) {
-      playBuzzerSound();
-    }
-  }, [teams, soundEnabled, activeClueId, roomCode]);
-
-  // Keyboard shortcut listener (Keys 1 - 4 trigger buzz, Esc closes modals)
+  // Keyboard shortcut listener (Keys 1 - 4 buzz for that team, Esc closes dialogs)
   useEffect(() => {
     const handleKeyDown = (e: KeyboardEvent) => {
-      if (e.target instanceof HTMLInputElement || e.target instanceof HTMLTextAreaElement) {
+      if (e.target instanceof HTMLInputElement || e.target instanceof HTMLTextAreaElement || e.target instanceof HTMLSelectElement) {
         return;
       }
+      if (isPhoneDevice || currentView === 'buzzer') return;
 
       if (e.key === 'Escape') {
-        setActiveClue(null);
+        if (activeClue) handleDismissClue();
         setIsQrModalOpen(false);
         setIsBuzzerQueueOpen(false);
       } else if (['1', '2', '3', '4'].includes(e.key)) {
         const teamIndex = parseInt(e.key, 10) - 1;
-        if (teams[teamIndex]) {
-          triggerBuzzer(teams[teamIndex].id);
-        }
+        if (teams[teamIndex]) void triggerBuzzer(teams[teamIndex].id);
       }
     };
 
     window.addEventListener('keydown', handleKeyDown);
     return () => window.removeEventListener('keydown', handleKeyDown);
-  }, [teams, triggerBuzzer]);
+  }, [teams, triggerBuzzer, activeClue, handleDismissClue, isPhoneDevice, currentView]);
 
-  // Handle Score Award
+  // Host judges the answering team
   const handleAwardScore = (clueId: string, teamId: string, isCorrect: boolean, amount: number) => {
-    // 1. Update team score and streak
     setTeams((prevTeams) =>
       prevTeams.map((t) => {
         if (t.id === teamId) {
@@ -229,25 +187,25 @@ export default function App() {
       })
     );
 
-    // 2. Mark clue state
-    if (isCorrect) {
-      setCategories((prevCats) =>
-        prevCats.map((cat) => ({
-          ...cat,
-          clues: cat.clues.map((c) =>
-            c.id === clueId ? { ...c, state: 'CLAIMED' as const, claimedByTeamId: teamId } : c
-          ),
-        }))
-      );
+    if (!isCorrect) {
+      // Wrong: that team is locked out, the clock resumes and the other teams may buzz
+      void markWrong(roomCode, teamId).then(refresh);
+      return;
     }
 
-    // 3. Clear buzzers & close modal
-    setBuzzerQueue([]);
+    setCategories((prevCats) =>
+      prevCats.map((cat) => ({
+        ...cat,
+        clues: cat.clues.map((c) =>
+          c.id === clueId ? { ...c, state: 'CLAIMED' as const, claimedByTeamId: teamId } : c
+        ),
+      }))
+    );
     setActiveClue(null);
-    void closeClue(roomCode);
+    void closeClue(roomCode).then(refresh);
   };
 
-  // Handle Clue Pass
+  // Nobody got it: retire the tile
   const handlePassClue = (clueId: string) => {
     setCategories((prevCats) =>
       prevCats.map((cat) => ({
@@ -257,9 +215,8 @@ export default function App() {
         ),
       }))
     );
-    setBuzzerQueue([]);
     setActiveClue(null);
-    void closeClue(roomCode);
+    void closeClue(roomCode).then(refresh);
   };
 
   // Adjust score manually
@@ -283,7 +240,8 @@ export default function App() {
         }))
       );
       setTeams((prev) => prev.map((t) => ({ ...t, score: 0, streak: 0 })));
-      setBuzzerQueue([]);
+      setActiveClue(null);
+      void closeClue(roomCode).then(refresh);
     }
   };
 
@@ -311,20 +269,18 @@ export default function App() {
     setTeams((prev) => [...prev, newTeam]);
   };
 
-  const activeBuzz = buzzerQueue.length > 0 ? buzzerQueue[0] : null;
-
   return (
     <div className="bg-[#0f0d15] text-[#e6e0ec] font-body-md bg-grid-cyber min-h-screen flex flex-col justify-between selection:bg-[#c3f400] selection:text-black">
       {/* Top Navigation Header */}
       {!isPhoneDevice && (
-      <Header
-        currentView={currentView}
-        setCurrentView={setCurrentView}
-        roomCode={roomCode}
-        soundEnabled={soundEnabled}
-        setSoundEnabled={setSoundEnabled}
-        onOpenQrModal={() => setIsQrModalOpen(true)}
-      />
+        <Header
+          currentView={currentView}
+          setCurrentView={setCurrentView}
+          roomCode={roomCode}
+          soundEnabled={soundEnabled}
+          setSoundEnabled={setSoundEnabled}
+          onOpenQrModal={() => setIsQrModalOpen(true)}
+        />
       )}
 
       {/* Main View Container */}
@@ -333,11 +289,13 @@ export default function App() {
           <MobileBuzzerView
             roomCode={roomCode}
             teams={teams}
-            activeClue={activeClue}
-            activeBuzz={activeBuzz}
-            soundEnabled={soundEnabled}
             roomInfo={roomInfo}
-            onBuzz={(teamId, timeTakenMs) => triggerBuzzer(teamId, timeTakenMs)}
+            activeClue={activeClue}
+            round={activeRound}
+            answerer={activeRound ? answerer : null}
+            serverOffsetMs={serverOffsetMs}
+            soundEnabled={soundEnabled}
+            onBuzz={(teamId, timeTakenMs) => void triggerBuzzer(teamId, timeTakenMs)}
             onJoinTeam={handleJoinTeam}
             onBackToBoard={isPhoneDevice ? undefined : () => setCurrentView('board')}
           />
@@ -357,12 +315,9 @@ export default function App() {
               teams={teams}
               roomCode={roomCode}
               buzzerQueue={buzzerQueue}
-              onSelectClue={(clue, categoryName) => {
-                setActiveClue(clue);
-                setActiveCategoryName(categoryName);
-                setBuzzerQueue([]); // Reset buzzer for this clue
-                void openClue(roomCode, clue, categoryName, teams);
-              }}
+              timerSeconds={timerSeconds}
+              onChangeTimerSeconds={handleChangeTimerSeconds}
+              onSelectClue={handleOpenClue}
               onResetBoard={handleResetBoard}
               onOpenDeckBuilder={() => setCurrentView('builder')}
               onOpenBuzzerQueue={() => setIsBuzzerQueueOpen(true)}
@@ -373,7 +328,7 @@ export default function App() {
               teams={teams}
               activeBuzzedTeamId={activeBuzz?.teamId || null}
               onAdjustScore={handleAdjustScore}
-              onTriggerBuzzer={triggerBuzzer}
+              onTriggerBuzzer={(teamId) => void triggerBuzzer(teamId)}
               onAddTeam={handleAddTeam}
             />
 
@@ -387,15 +342,20 @@ export default function App() {
         )}
       </main>
 
-      {/* Active Clue Dialog */}
+      {/* Active Clue Dialog (host only) */}
       {activeClue && currentView !== 'buzzer' && (
         <ClueModal
           clue={activeClue}
           categoryName={activeCategoryName}
           teams={teams}
-          activeBuzz={activeBuzz}
+          round={activeRound}
+          answerer={activeRound ? answerer : null}
+          serverOffsetMs={serverOffsetMs}
+          timerSeconds={timerSeconds}
           soundEnabled={soundEnabled}
-          onClose={() => setActiveClue(null)}
+          onStart={handleStartRound}
+          onExtend={handleExtendRound}
+          onClose={handleDismissClue}
           onAwardScore={handleAwardScore}
           onPassClue={handlePassClue}
         />
@@ -415,13 +375,8 @@ export default function App() {
         <BuzzerQueueModal
           queue={buzzerQueue}
           teams={teams}
-          onClearQueue={() => setBuzzerQueue([])}
-          onSelectTeamToAnswer={(teamId) => {
-            const team = teams.find((t) => t.id === teamId);
-            if (team && activeClue) {
-              // Active team selected
-            }
-          }}
+          onClearQueue={handleReleaseBuzzer}
+          onSelectTeamToAnswer={() => undefined}
           onClose={() => setIsBuzzerQueueOpen(false)}
         />
       )}
