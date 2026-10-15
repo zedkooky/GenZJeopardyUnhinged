@@ -1,11 +1,13 @@
-import { getRoomStore } from './_lib/roomStore.js';
+import { countByTeam, getRoomStore, MAX_PLAYERS_PER_TEAM } from './_lib/roomStore.js';
 import { queryString, type ApiReq, type ApiRes } from './_lib/http.js';
 
 const ROOM_PATTERN = /^[A-Z0-9-]{4,24}$/;
+const PLAYER_PATTERN = /^[A-Za-z0-9-]{8,64}$/;
+const MAX_TEAM_NAME_LENGTH = 24;
 
 /**
- * GET  /api/room?room=CODE  -> { active, teams, buzzes, version, storage }
- * POST /api/room            -> { room, action: 'open' | 'close' | 'teams' | 'buzz', ... }
+ * GET  /api/room?room=CODE[&playerId=ID] -> { active, teams, buzzes, teamNames, playerCounts, myTeamId, maxPerTeam, ... }
+ * POST /api/room            -> { room, action: 'open' | 'close' | 'teams' | 'buzz' | 'join' | 'rename', ... }
  */
 export default async function handler(req: ApiReq, res: ApiRes) {
   try {
@@ -14,8 +16,22 @@ export default async function handler(req: ApiReq, res: ApiRes) {
     if (req.method === 'GET') {
       const room = queryString(req.query.room).toUpperCase();
       if (!ROOM_PATTERN.test(room)) return res.status(400).json({ error: 'Invalid room code' });
-      const [state, buzzes] = await Promise.all([store.getState(room), store.getBuzzes(room)]);
-      return res.status(200).json({ ...state, buzzes, storage: store.kind });
+      const playerId = queryString(req.query.playerId);
+      const [state, buzzes, players, teamNames] = await Promise.all([
+        store.getState(room),
+        store.getBuzzes(room),
+        store.getPlayers(room),
+        store.getTeamNames(room),
+      ]);
+      return res.status(200).json({
+        ...state,
+        buzzes,
+        teamNames,
+        playerCounts: countByTeam(players),
+        myTeamId: players[playerId] ?? null,
+        maxPerTeam: MAX_PLAYERS_PER_TEAM,
+        storage: store.kind,
+      });
     }
 
     if (req.method !== 'POST') return res.status(405).json({ error: 'Method not allowed' });
@@ -52,6 +68,25 @@ export default async function handler(req: ApiReq, res: ApiRes) {
           timeTakenMs: Number(body.timeTakenMs) || 0,
         });
         return res.status(200).json({ accepted });
+      }
+      case 'join': {
+        const playerId = String(body.playerId ?? '');
+        const teamId = String(body.teamId ?? '');
+        if (!PLAYER_PATTERN.test(playerId)) return res.status(400).json({ error: 'Invalid player id' });
+        const state = await store.getState(room);
+        if (!state.teams?.some((t: { id: string }) => t.id === teamId)) {
+          return res.status(404).json({ error: 'Unknown team' });
+        }
+        const result = await store.joinTeam(room, playerId, teamId);
+        if (!result.ok) return res.status(409).json({ error: 'Team is full', playerCounts: result.counts });
+        return res.status(200).json({ playerCounts: result.counts });
+      }
+      case 'rename': {
+        const teamId = String(body.teamId ?? '');
+        const name = String(body.name ?? '').trim().slice(0, MAX_TEAM_NAME_LENGTH);
+        if (!teamId || !name) return res.status(400).json({ error: 'teamId and name are required' });
+        await store.setTeamName(room, teamId, name);
+        return res.status(200).json({ ok: true });
       }
       default:
         return res.status(400).json({ error: 'Unknown action' });

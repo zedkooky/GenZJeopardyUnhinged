@@ -9,15 +9,21 @@ import { MobileBuzzerView } from './components/MobileBuzzerView';
 import { JoinQrModal } from './components/JoinQrModal';
 import { BuzzerQueueModal } from './components/BuzzerQueueModal';
 import { Category, Clue, Team, StagingClue, BuzzerEvent } from './types/game';
-import { INITIAL_CATEGORIES, INITIAL_TEAMS, INITIAL_STAGING_BUFFER } from './data/defaultDeck';
+import { INITIAL_CATEGORIES, INITIAL_TEAMS, INITIAL_STAGING_BUFFER, MAX_TEAMS } from './data/defaultDeck';
 import { playBuzzerSound } from './utils/audio';
-import { openClue, closeClue, sendBuzz, fetchRoom, loadRoomCode } from './utils/realtime';
+import { openClue, closeClue, sendBuzz, fetchRoom, loadRoomCode, loadPlayerId, joinTeam, renameTeam, publishTeams, type RoomSnapshot, type JoinOutcome } from './utils/realtime';
 
 export default function App() {
   // Check URL parameters for mode
   const initialMode = typeof window !== 'undefined' && new URLSearchParams(window.location.search).get('mode') === 'buzzer'
     ? 'buzzer'
     : 'board';
+
+  // A phone that opened the join link: show only the buzzer, never the host controls
+  const isPhoneDevice = initialMode === 'buzzer';
+  const [playerId] = useState<string>(loadPlayerId);
+  const [roomInfo, setRoomInfo] = useState<Pick<RoomSnapshot, 'playerCounts' | 'myTeamId' | 'maxPerTeam' | 'storage'> | null>(null);
+  const appliedNameAt = useRef<Record<string, number>>({});
 
   const [currentView, setCurrentView] = useState<'board' | 'builder' | 'buzzer'>(initialMode);
   const [categories, setCategories] = useState<Category[]>(() => {
@@ -74,10 +80,18 @@ export default function App() {
 
     const tick = async () => {
       if (document.visibilityState === 'visible') {
-        const snap = await fetchRoom(roomCode);
+        const snap = await fetchRoom(roomCode, isPhoneDevice ? playerId : undefined);
         if (snap && !cancelled) {
           if (isBuzzerView) {
-            if (snap.teams?.length) setTeams(snap.teams);
+            if (snap.teams?.length) {
+              // Renames made on phones show immediately, before the host board has applied them
+              const named = snap.teams.map((t) => ({ ...t, name: snap.teamNames?.[t.id]?.name ?? t.name }));
+              setTeams((prev) => (JSON.stringify(prev) === JSON.stringify(named) ? prev : named));
+            }
+            setRoomInfo((prev) => {
+              const next = { playerCounts: snap.playerCounts, myTeamId: snap.myTeamId, maxPerTeam: snap.maxPerTeam, storage: snap.storage };
+              return JSON.stringify(prev) === JSON.stringify(next) ? prev : next;
+            });
             if (snap.active && snap.active.clueId !== activeClueId) {
               setActiveClue(snap.active.clue);
               setActiveCategoryName(snap.active.categoryName);
@@ -85,6 +99,19 @@ export default function App() {
             } else if (!snap.active && activeClueId) {
               setActiveClue(null);
               setBuzzerQueue([]);
+            }
+          }
+          if (!isBuzzerView) {
+            // Players can rename their team from their phone; the host applies each rename once
+            const renames = Object.entries(snap.teamNames ?? {}).filter(
+              ([id, v]) => v.at > (appliedNameAt.current[id] ?? 0),
+            );
+            if (renames.length > 0) {
+              renames.forEach(([id, v]) => { appliedNameAt.current[id] = v.at; });
+              setTeams((prev) => prev.map((t) => {
+                const hit = renames.find(([id]) => id === t.id);
+                return hit ? { ...t, name: hit[1].name } : t;
+              }));
             }
           }
           const roomClueId = snap.active?.clueId ?? null;
@@ -115,6 +142,29 @@ export default function App() {
       clearTimeout(timer);
     };
   }, [roomCode, isBuzzerView, activeClueId]);
+
+  // Host keeps the room's team list (names + scores) fresh for phones
+  const teamsSignature = JSON.stringify(teams.map((t) => [t.id, t.name, t.score, t.emoji]));
+  useEffect(() => {
+    if (isPhoneDevice || currentView === 'buzzer') return;
+    const timer = setTimeout(() => void publishTeams(roomCode, teamsRef.current), 400);
+    return () => clearTimeout(timer);
+  }, [teamsSignature, roomCode, isPhoneDevice, currentView]);
+
+  // Phone: join a team, optionally naming it
+  const handleJoinTeam = useCallback(async (teamId: string, teamName: string): Promise<JoinOutcome> => {
+    const outcome = await joinTeam(roomCode, playerId, teamId);
+    if (outcome !== 'joined') return outcome;
+    const current = teamsRef.current.find((t) => t.id === teamId);
+    const cleaned = teamName.trim();
+    if (cleaned && cleaned !== current?.name) {
+      await renameTeam(roomCode, teamId, cleaned);
+      setTeams((prev) => prev.map((t) => (t.id === teamId ? { ...t, name: cleaned } : t)));
+    }
+    const snap = await fetchRoom(roomCode, playerId);
+    if (snap) setRoomInfo({ playerCounts: snap.playerCounts, myTeamId: snap.myTeamId, maxPerTeam: snap.maxPerTeam, storage: snap.storage });
+    return 'joined';
+  }, [roomCode, playerId]);
 
   // Trigger buzz for a team
   const triggerBuzzer = useCallback((teamId: string, timeTakenMs?: number) => {
@@ -239,6 +289,10 @@ export default function App() {
 
   // Add custom team
   const handleAddTeam = () => {
+    if (teams.length >= MAX_TEAMS) {
+      alert(`This game is set up for ${MAX_TEAMS} teams.`);
+      return;
+    }
     const teamName = prompt('Enter new team name:');
     if (!teamName) return;
     const emojis = ['🚀', '⚡', '🔥', '👾', '🎯', '🦄', '👑', '🍕'];
@@ -262,6 +316,7 @@ export default function App() {
   return (
     <div className="bg-[#0f0d15] text-[#e6e0ec] font-body-md bg-grid-cyber min-h-screen flex flex-col justify-between selection:bg-[#c3f400] selection:text-black">
       {/* Top Navigation Header */}
+      {!isPhoneDevice && (
       <Header
         currentView={currentView}
         setCurrentView={setCurrentView}
@@ -270,9 +325,10 @@ export default function App() {
         setSoundEnabled={setSoundEnabled}
         onOpenQrModal={() => setIsQrModalOpen(true)}
       />
+      )}
 
       {/* Main View Container */}
-      <main className="w-full pt-22 pb-8 px-4 md:px-8 max-w-[1680px] mx-auto flex-1 flex flex-col">
+      <main className={`w-full ${isPhoneDevice ? 'pt-4' : 'pt-22'} pb-8 px-4 md:px-8 max-w-[1680px] mx-auto flex-1 flex flex-col`}>
         {currentView === 'buzzer' ? (
           <MobileBuzzerView
             roomCode={roomCode}
@@ -280,8 +336,10 @@ export default function App() {
             activeClue={activeClue}
             activeBuzz={activeBuzz}
             soundEnabled={soundEnabled}
+            roomInfo={roomInfo}
             onBuzz={(teamId, timeTakenMs) => triggerBuzzer(teamId, timeTakenMs)}
-            onBackToBoard={() => setCurrentView('board')}
+            onJoinTeam={handleJoinTeam}
+            onBackToBoard={isPhoneDevice ? undefined : () => setCurrentView('board')}
           />
         ) : currentView === 'builder' ? (
           <DeckBuilder
@@ -330,7 +388,7 @@ export default function App() {
       </main>
 
       {/* Active Clue Dialog */}
-      {activeClue && (
+      {activeClue && currentView !== 'buzzer' && (
         <ClueModal
           clue={activeClue}
           categoryName={activeCategoryName}
