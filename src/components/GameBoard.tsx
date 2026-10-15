@@ -1,4 +1,4 @@
-import React from 'react';
+import React, { useState, useEffect } from 'react';
 import { 
   Bell, 
   RotateCcw, 
@@ -6,16 +6,22 @@ import {
   Flame, 
   LayoutGrid, 
   Sparkles,
-  Zap
+  Zap,
+  Timer
 } from 'lucide-react';
 import { motion, AnimatePresence } from 'motion/react';
 import { Category, Clue, Team, BuzzerEvent } from '../types/game';
+import { MIN_TIMER_SECONDS, MAX_TIMER_SECONDS } from '../utils/realtime';
+
+const TIMER_PRESETS_SECONDS = [30, 60, 90, 120];
 
 interface GameBoardProps {
   categories: Category[];
   teams: Team[];
   roomCode: string;
   buzzerQueue: BuzzerEvent[];
+  timerSeconds: number;
+  onChangeTimerSeconds: (seconds: number) => void;
   onSelectClue: (clue: Clue, categoryName: string) => void;
   onResetBoard: () => void;
   onOpenDeckBuilder: () => void;
@@ -27,11 +33,24 @@ export const GameBoard: React.FC<GameBoardProps> = ({
   teams,
   roomCode,
   buzzerQueue,
+  timerSeconds,
+  onChangeTimerSeconds,
   onSelectClue,
   onResetBoard,
   onOpenDeckBuilder,
   onOpenBuzzerQueue,
 }) => {
+  // The box keeps what the host is typing; the setting only changes once it is a valid number
+  const [timerDraft, setTimerDraft] = useState(String(timerSeconds));
+  useEffect(() => setTimerDraft(String(timerSeconds)), [timerSeconds]);
+  const handleTimerInput = (value: string) => {
+    setTimerDraft(value);
+    const seconds = Number(value);
+    if (Number.isInteger(seconds) && seconds >= MIN_TIMER_SECONDS && seconds <= MAX_TIMER_SECONDS) {
+      onChangeTimerSeconds(seconds);
+    }
+  };
+
   // Count remaining available clues
   let totalClues = 0;
   let remainingClues = 0;
@@ -79,6 +98,39 @@ export const GameBoard: React.FC<GameBoardProps> = ({
               </span>
             </div>
           )}
+        </div>
+
+        {/* Clue timer setting */}
+        <div className="flex flex-wrap items-center gap-2 bg-[#211e27] px-3 py-1.5 rounded-xl border border-white/5 shadow-[2px_2px_0_#000000]">
+          <Timer className="w-4 h-4 text-[#ffb0cd]" />
+          <label htmlFor="clue-timer" className="font-space text-xs font-bold uppercase text-[#ccc3d8]">
+            Clue timer
+          </label>
+          <input
+            id="clue-timer"
+            type="number"
+            min={MIN_TIMER_SECONDS}
+            max={MAX_TIMER_SECONDS}
+            value={timerDraft}
+            onChange={(e) => handleTimerInput(e.target.value)}
+            onBlur={() => setTimerDraft(String(timerSeconds))}
+            className="w-16 bg-[#0f0d15] text-[#c3f400] font-space font-bold text-sm text-center rounded-lg border border-white/10 focus:border-[#c3f400] outline-none py-0.5"
+          />
+          <span className="font-space text-xs text-[#ccc3d8]">sec</span>
+          <div className="flex items-center gap-1">
+            {TIMER_PRESETS_SECONDS.map((seconds) => (
+              <button
+                key={seconds}
+                type="button"
+                onClick={() => onChangeTimerSeconds(seconds)}
+                className={`px-2 py-0.5 rounded-md font-space text-[11px] font-bold ${
+                  timerSeconds === seconds ? 'bg-[#c3f400] text-black' : 'bg-[#2b2932] text-[#ccc3d8] hover:text-white'
+                }`}
+              >
+                {seconds}
+              </button>
+            ))}
+          </div>
         </div>
 
         {/* Quick Action Controls */}

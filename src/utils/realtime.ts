@@ -1,21 +1,36 @@
 import type { Clue, Team } from '../types/game';
 
-export interface RoomBuzz {
+export type RoundStatus = 'reading' | 'open' | 'answering' | 'ended';
+
+/** One clue round as held by the server. Times are server-clock epoch milliseconds. */
+export interface RoomRound {
+  clueId: string;
+  categoryName: string;
+  clue: Clue;
+  status: RoundStatus;
+  durationMs: number;
+  remainingMs: number;
+  deadline: number | null;
+  lockedTeams: string[];
+  endReason: 'timeup' | 'exhausted' | null;
+}
+
+export interface RoomClaim {
   teamId: string;
   timestamp: number;
   timeTakenMs: number;
 }
 
 export interface RoomSnapshot {
-  active: { clueId: string; categoryName: string; clue: Clue } | null;
+  serverNow: number;
+  active: RoomRound | null;
+  answerer: RoomClaim | null;
   teams: Team[] | null;
-  buzzes: RoomBuzz[];
-  version: number;
-  storage: 'redis' | 'memory';
   teamNames: Record<string, { name: string; at: number }>;
   playerCounts: Record<string, number>;
   myTeamId: string | null;
   maxPerTeam: number;
+  storage: 'redis' | 'memory';
 }
 
 export type JoinOutcome = 'joined' | 'full' | 'failed';
@@ -33,15 +48,22 @@ async function post(body: Record<string, unknown>): Promise<boolean> {
   }
 }
 
-export const openClue = (room: string, clue: Clue, categoryName: string, teams: Team[]) =>
-  post({ room, action: 'open', clue, categoryName, teams });
-
+// Host actions
+export const openClue = (room: string, clue: Clue, categoryName: string, teams: Team[], durationMs: number) =>
+  post({ room, action: 'open', clue, categoryName, teams, durationMs });
+export const startRound = (room: string) => post({ room, action: 'start' });
+export const extendRound = (room: string, ms: number) => post({ room, action: 'extend', ms });
+export const markWrong = (room: string, teamId: string) => post({ room, action: 'wrong', teamId });
+export const releaseBuzzer = (room: string) => post({ room, action: 'release' });
 export const closeClue = (room: string) => post({ room, action: 'close' });
-
 export const publishTeams = (room: string, teams: Team[]) => post({ room, action: 'teams', teams });
 
+// Player actions
 export const sendBuzz = (room: string, clueId: string, teamId: string, timeTakenMs: number) =>
   post({ room, action: 'buzz', clueId, teamId, timeTakenMs });
+
+export const renameTeam = (room: string, teamId: string, name: string) =>
+  post({ room, action: 'rename', teamId, name });
 
 export async function joinTeam(room: string, playerId: string, teamId: string): Promise<JoinOutcome> {
   try {
@@ -56,9 +78,6 @@ export async function joinTeam(room: string, playerId: string, teamId: string): 
     return 'failed';
   }
 }
-
-export const renameTeam = (room: string, teamId: string, name: string) =>
-  post({ room, action: 'rename', teamId, name });
 
 export async function fetchRoom(room: string, playerId?: string): Promise<RoomSnapshot | null> {
   try {
@@ -100,4 +119,18 @@ export function loadPlayerId(): string {
   } catch {
     return fresh();
   }
+}
+
+export const DEFAULT_TIMER_SECONDS = 30;
+export const MIN_TIMER_SECONDS = 5;
+export const MAX_TIMER_SECONDS = 600;
+
+export function loadTimerSeconds(): number {
+  try {
+    const saved = Number(localStorage.getItem('jeopardy_timer_seconds'));
+    if (Number.isFinite(saved) && saved >= MIN_TIMER_SECONDS && saved <= MAX_TIMER_SECONDS) return Math.round(saved);
+  } catch {
+    // fall through
+  }
+  return DEFAULT_TIMER_SECONDS;
 }
